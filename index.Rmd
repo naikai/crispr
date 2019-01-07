@@ -1,0 +1,221 @@
+---
+title: "sgRNA + CCLE - heatmap"
+author: "Ray"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+params:
+    workdir: "./"
+    prefix: "genomeCRIPSR"
+    tissue.type: "PANCREAS"
+    mut.genes: "TP53"
+    genealt.RDS: "./CRISPR_annot_allgenes_status.RDS"
+    sgRNA.RDS: "./GenomeCRISPR_full05112017.RDS"
+    ccle_tpm.RDS: "./CCLE_RNASeq_tpm_matched_CRISPR.RDS"
+runtime: shiny
+---
+
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+#rm(list = ls())
+cleanMem <- function(n=10) { for (i in 1:n) gc() }
+
+### Combine gene alteration status in CCLE data + CRISPR sgRNA data from genomeCRISPR database
+library(shiny)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+source("helper.R")
+options('download.file.method'='curl')
+
+#folder <- params$workdir
+#knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_knit$set(root.dir = folder)
+
+prefix <- params$prefix
+# tissue <- params$tissue
+tissue.type <- toupper(c("PANCREAS", "AML", "BREAST"))
+mut.genes <- params$gene
+genealt.RDS <- params$genealt.RDS
+sgRNA.RDS <- params$sgRNA.RDS
+ccle_tpm.RDS <- params$ccle_tpm.RDS
+```
+
+
+```{r ccle, echo=FALSE, message=FALSE, warning=FALSE}
+### Input files
+# genealt.RDS (CCLE mutational data)
+# sgRNA.RDS (genomeCRISPR logFC data)
+# ccle_tpm.RDS (CCLE expresion data)
+
+genealt <- readRDS(genealt.RDS)
+genealt$name <- gsub(" ", "-", genealt$name)
+genealt$type <- gsub(" .*", "", genealt$type) %>% 
+  gsub("^B$", "BURKITT", .)
+# sgRNA
+sgRNA <- readRDS(sgRNA.RDS)
+# ccle_tpm
+ccle_tpm <- readRDS(ccle_tpm.RDS)
+```
+
+```{r echo=FALSE}
+### Filtering 
+##- Genes 
+    #+ genes that have mutation info in CCLE
+    #+ genes in the sgRNA for plotting 
+#- Samples 
+    #+ Type (tissue)
+```
+
+
+```{r snow, echo=FALSE, message=FALSE, fig.width=12, fig.height=12}
+# observe({
+#      # periodically collect
+#      invalidateLater(1000,session)
+#      cleanMem()
+#    })
+cleanMem()
+
+# Copy the chunk below to make a group of checkboxes
+checkboxGroupInput("tissue.type", label = h4("Please select:"), 
+                   choices = genealt$type %>% unique %>% sort %>% c("ALL", .), 
+                   inline = TRUE, width='600px', 
+                   selected = "AML")
+
+selectizeInput("plot.genes", "Plot Genes (you can either select from below or type in your genes of interest)", 
+	sgRNA$symbol %>% c("TP53", "KRAS", "NRAS", "PTEN", "EGFR", "MYC", "SMAD4", "CDKN1A", "CDKN2A", "IDH1", "IDH2", .) %>% unique, 
+	selected = c("PCNA", "BRAF", "TP53", "MDM2"), multiple = TRUE, width="700px",
+	options = list(maxOptions = 5, placeholder = 'e.g., TP53, MDM2'))
+
+selectizeInput("mut.genes", "Gene mutations info: (again, type in your genes of interest)", 
+		colnames(genealt)[-c(1:9)] %>% gsub("-.*", "", .) %>% c("TP53", "KRAS", "NRAS", "PTEN", "EGFR", "MYC", "SMAD4", "CDKN1A", "CDKN2A", "IDH1", "IDH2", .) %>% unique, 
+		selected = c("TP53"), multiple = TRUE, width="700px",
+		options = list(maxOptions = 10, placeholder = 'e.g., TP53, MDM2'))
+
+renderPlot({
+  prefix <- paste(input$tissue.type, collapse = "_")
+  tissue.type <- input$tissue.type 
+  # tissue.type <- c("AML", "BREAST", "NSCLC", "BL", "MELANOMA", "COLON", "LIVER", "OVARY")
+  # tissue.type <- "ALL"
+  tissue.type <- input$tissue.type 
+  plot.genes <- input$plot.genes
+  
+  #mut.genes <- c("TP53")
+  mut.genes <- input$mut.genes
+
+  # how to bin/combine coloring for mutations - simple, merge, all
+  mut.color.type <- "merge"
+
+
+### Run from below 
+mut.genes.col <- expand.grid(mut.genes, c("-change", "-type")) %>% 
+  mutate(Var1 = as.character(Var1), 
+         Var2 = as.character(Var2), 
+         name = paste0(Var1, Var2)) %>% 
+  left_join(tibble(Var1 = mut.genes), ., by="Var1") %>% 
+  pull(name)
+
+
+# Sort by the number of mutations in the record by decending order
+# NAs in column '-change' are the splice_sites
+col.idx <- match(mut.genes.col, colnames(genealt))
+mut.genes.annot <- genealt[, c(1:9, col.idx)] %>% 
+  mutate(tissue = gsub("BREST", "BREAST", tissue)) %>% 
+  mutate(type = ifelse(type == "B", "BURKITT", type)) %>% 
+  replace(is.na(.), "Splice_Site") #%>%
+
+# filter based on tissue type
+min.samp <- 2
+if (tissue.type != "ALL"){
+  final.annot <- mut.genes.annot %>% 
+    filter(type %in% tissue.type) 
+  if(nrow(final.annot) >= min.samp){
+    print(paste("### Running for type:", tissue.type, "with", nrow(final.annot), "samples")) 
+  }else{
+    stop(paste("### samples for this type", tissue.type, "is less than", min.samp, "samples"))
+  }
+}else{
+  prefix <- "ALL"
+  final.annot <- mut.genes.annot
+}
+
+final.annot <- final.annot %>% 
+  mutate(Sample_name = paste(cell, pub, type, sep="_")) %>% 
+  mutate(Sample_name = make.unique(Sample_name)) %>% 
+  mutate_at(vars(contains("-type")), funs(merge_mutation(., type=mut.color.type)))
+
+plot.sgRNA <- tibble(symbol = plot.genes) %>% 
+  left_join(., sgRNA, by="symbol") %>% 
+  dplyr::select(Gene = symbol, final.annot$name)
+
+
+
+### pheatmap
+x2 <- plot.sgRNA %>% 
+  replace(is.na(.), 0) %>% 
+  set_names(c("Gene", final.annot$Sample_name)) %>% 
+  convert_tibble_to_dataframe()
+
+# Defines the vector of colors for the legend (it has to be of the same lenght of breaksList)
+x2.min <- floor(min(x2, na.rm = TRUE))
+x2.max <- ceiling(max(x2, na.rm = TRUE))
+
+breaks = c(seq(x2.min, -0.51, length.out = 101), seq(-0.5, 0.5, length.out = 101), seq(0.51, x2.max, length.out=101))
+breaks2 <- breaks
+# color <- colorRampPalette(c("cyan1", "grey5", "red"))(length(breaks2))
+color <- colorRampPalette(c("lightskyblue1", "grey5", "red"))(length(breaks2))
+# color <- colorRampPalette(c("cadetblue1", "grey5", "red"))(length(breaks2))
+breaks2[length(breaks)] <- max(x2.max, max(breaks))
+breaks2[1] <- min(x2.min, min(breaks))
+
+fontsize_row <- pheatmap_fontsize_row(x2)
+fontsize_col <- pheatmap_fontsize_col(x2)
+  
+### create_annot_for_color
+annotation_col <- final.annot %>% 
+  dplyr::select(Sample_name, type, mut.genes.col) %>% 
+  dplyr::select(-contains("-change")) %>% 
+  #select_if(~ length(unique(.)) > 1) %>% 
+  set_names(gsub("-type", "", colnames(.))) %>%
+  convert_tibble_to_dataframe()
+  
+# create custom colors for each column_side_colors
+# type.dat <- matrix(NA, nrow=nrow(annotation_col), ncol=ncol(annotation_col))
+# colnames(type.dat) <- mut.genes
+mycolors <- list()
+for(i in 1:ncol(annotation_col)){
+  cur.typename <- colnames(annotation_col)[i]
+  cur.muttype <- annotation_col[, i]
+  
+  if(cur.typename == "type"){
+    num.cur.muttype <- cur.muttype %>% unique %>% length
+    type_col <- colorRampPalette(brewer.pal(n = num.cur.muttype, name = "Spectral"))(num.cur.muttype)
+    names(type_col) <- cur.muttype %>% unique
+    mycolors[[cur.typename]] <- type_col
+  }else{
+    mycolors[[cur.typename]] <- mut_color_predefined()[unique(c("WT", sort(cur.muttype)))]
+  }
+}
+  
+# 
+pdf_height <- pheatmap_pdf_height(x2) + 1
+pdf_width <- pheatmap_pdf_width(x2)
+
+  pheatmap(x2, color=color,
+           clustering_method = "ward.D2",
+           annotation_col = annotation_col,
+           annotation_colors = mycolors,
+           breaks = breaks2,
+           cluster_cols = TRUE,
+           cluster_rows = TRUE,
+           scale = "none", 
+           show_rownames = TRUE,
+           fontsize_row = fontsize_row,
+           fontsize_col = fontsize_col,
+           border_color = NA,
+           main = paste0(prefix, "\n")
+  )
+#})
+}, height=650)
+```
+
+
+
